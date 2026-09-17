@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use shared_promptforge_api::cancel::CancelHandle;
 use shared_promptforge_api::capabilities::{
     Capability, CapabilityError, CapabilityErrorKind, CapabilityId, Contribution, RunServices,
 };
@@ -78,6 +79,22 @@ pub struct Agents {
 }
 
 impl Agents {
+    /// Lends a PromptForge tool to the nested agent.
+    ///
+    /// The nested agent runs its own tool loop, so a tool handed over here
+    /// is one the nested agent may call on its own - the calling prompt
+    /// never sees those calls, only the text the agent finished with. The
+    /// tool is bridged, not reimplemented: Everruns' tool shape is
+    /// `(name, description, schema, async handler)`, which is exactly what
+    /// the PromptForge [`Tool`] trait already exposes.
+    #[must_use]
+    pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Agents {
+        self.run.tools.push(tool);
+        self
+    }
+}
+
+impl Agents {
     /// Builds the capability against a gateway root and bearer token.
     ///
     /// The nested agent runs on the `default_model` catalog id unless a
@@ -121,6 +138,8 @@ impl Agents {
                     token,
                     model,
                 },
+                tools: Vec::new(),
+                cancel: None,
             },
         })
     }
@@ -138,9 +157,46 @@ impl Agents {
                 backing: Backing::Simulated {
                     response: response.into(),
                 },
+                tools: Vec::new(),
+                cancel: None,
             },
         }
     }
+}
+
+/// Builds the cancellation error a stopped run reports.
+fn cancelled() -> ToolError {
+    ToolError::message("promptforge/agent: the run was cancelled")
+        .with_kind(ToolErrorKind::Cancelled)
+}
+
+/// Bridges a PromptForge tool into the Everruns tool the nested agent
+/// calls.
+///
+/// The two shapes already line up - a name, a description, a JSON-Schema
+/// parameter object, and one async call taking and returning JSON - so
+/// this is an adapter, not a reimplementation. Everruns distinguishes a
+/// model-visible tool error (the nested loop continues and the model sees
+/// the message) from an internal one; a PromptForge [`ToolError`] is
+/// already written to be read by a model, so it maps to the former.
+fn bridge_tool(tool: Arc<dyn Tool>) -> everruns::FunctionTool {
+    let name = tool.wire_name().to_owned();
+    let description = tool.description().to_owned();
+    let schema = tool.parameters_schema();
+    everruns::FunctionTool::new(name, description, schema, move |args: serde_json::Value| {
+        let tool = Arc::clone(&tool);
+        async move {
+            let response = match tool.call(args).await {
+                Ok(output) => everruns::ToolResponse::text(output.text().to_owned()),
+                Err(error) => everruns::ToolResponse::error(error.to_string()),
+            };
+            // The handler's `Err` arm is Everruns' internal-error path,
+            // which redacts the message from the model. A PromptForge tool
+            // failure is already written to be read by a model, so both
+            // arms come back as `Ok` carrying the right `ToolResponse`.
+            Ok::<_, std::convert::Infallible>(response)
+        }
+    })
 }
 
 /// Builds the invalid-arguments error every constructor check returns.
@@ -168,17 +224,42 @@ impl Capability for Agents {
                     .with_kind(CapabilityErrorKind::Cancelled),
             );
         }
+        // The nested turn is cancelled with the run that started it: the
+        // handle is cloned in here, at activation, because that is when a
+        // run first exists to be cancelled with.
+        let mut run = self.run.clone();
+        run.cancel = Some(services.cancel.clone());
         Ok(Contribution {
-            tools: vec![Arc::new(self.run.clone())],
+            tools: vec![Arc::new(run)],
         })
     }
 }
 
 /// The `promptforge/agent/run` tool: one nested Everruns agent turn.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AgentRun {
     /// How this tool reaches its model.
     backing: Backing,
+    /// The PromptForge tools lent to the nested agent's own loop.
+    tools: Vec<Arc<dyn Tool>>,
+    /// The run's cancellation handle, cloned in at activation. `None`
+    /// before activation: a tool built but never activated has no run to
+    /// be cancelled with.
+    cancel: Option<CancelHandle>,
+}
+
+impl std::fmt::Debug for AgentRun {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentRun")
+            .field("backing", &self.backing)
+            .field(
+                "tools",
+                &self.tools.iter().map(|tool| tool.id()).collect::<Vec<_>>(),
+            )
+            .field("cancel", &self.cancel.is_some())
+            .finish()
+    }
 }
 
 impl AgentRun {
@@ -194,6 +275,9 @@ impl AgentRun {
             .name("promptforge-agent-run")
             .instructions(instructions)
             .max_iterations(MAX_ITERATIONS);
+        for tool in &self.tools {
+            builder = builder.tool(bridge_tool(Arc::clone(tool)));
+        }
         builder = match &self.backing {
             Backing::Gateway {
                 base_url,
@@ -215,9 +299,24 @@ impl AgentRun {
             ToolError::message(format!("promptforge/agent: agent is not valid: {error}"))
                 .with_kind(ToolErrorKind::InvalidArguments)
         })?;
+        // Cancelling the PromptForge run cancels the nested turn in
+        // flight: Everruns drops the turn's future and tears down any tool
+        // work it started, then reports the turn as cancelled rather than
+        // failed. The watcher task ends with the token it holds.
+        let token = everruns::CancellationToken::new();
+        if let Some(cancel) = self.cancel.clone() {
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
+            let token = token.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                token.cancel();
+            });
+        }
         let turn = everruns::Engine::new()
             .create(agent)
-            .send_and_wait(prompt)
+            .run_with(prompt, everruns::RunOptions::new().cancel_token(token))
             .await
             .map_err(|error| {
                 ToolError::message(format!("promptforge/agent: nested turn failed: {error}"))
@@ -225,6 +324,8 @@ impl AgentRun {
             })?;
         if turn.success {
             Ok(turn.response)
+        } else if self.cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
+            Err(cancelled())
         } else {
             Err(
                 ToolError::message("promptforge/agent: the nested agent did not complete its task")
@@ -314,8 +415,10 @@ impl Tool for AgentRun {
 #[cfg(test)]
 mod tests {
     use shared_promptforge_api::cancel::CancelHandle;
+    use std::sync::Arc;
+
     use shared_promptforge_api::capabilities::{Capability, CapabilityErrorKind, RunServices};
-    use shared_promptforge_api::tools::{ToolErrorKind, ToolId};
+    use shared_promptforge_api::tools::{Tool, ToolError, ToolErrorKind, ToolId, ToolOutput};
 
     use crate::Agents;
 
@@ -373,6 +476,81 @@ mod tests {
             .expect("the simulated nested turn succeeds");
 
         assert_eq!(output.text(), "nested answer");
+    }
+
+    /// A PromptForge tool that records whether the nested agent called it.
+    #[derive(Debug, Clone)]
+    struct Probe {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Probe {
+        fn id(&self) -> ToolId {
+            ToolId::from_validated("promptforge/agent/probe")
+        }
+
+        #[expect(
+            clippy::unnecessary_literal_bound,
+            reason = "the Tool trait fixes this return type to &str"
+        )]
+        fn wire_name(&self) -> &str {
+            "probe"
+        }
+
+        #[expect(
+            clippy::unnecessary_literal_bound,
+            reason = "the Tool trait fixes this return type to &str"
+        )]
+        fn description(&self) -> &str {
+            "Record that the nested agent reached a lent PromptForge tool."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::trusted("probed"))
+        }
+    }
+
+    #[test]
+    fn a_lent_tool_bridges_its_name_description_and_schema() {
+        let probe = Probe {
+            called: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        // The bridge is the whole claim: a PromptForge tool is already the
+        // shape Everruns wants, so building the Everruns tool from it
+        // cannot fail and needs no reimplementation.
+        let bridged = super::bridge_tool(Arc::new(probe));
+        let agent = everruns::Agent::builder()
+            .name("bridge-test")
+            .instructions("Use the probe.")
+            .model(everruns::Model::simulated("done"))
+            .tool(bridged)
+            .build();
+        assert!(agent.is_ok(), "a bridged PromptForge tool builds an agent");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_stops_the_nested_turn_before_it_starts() {
+        let capability = Agents::simulated("unreachable");
+        let cancel = CancelHandle::new();
+        let services = RunServices::new(shared_vfs::VfsRef::builder().build(), cancel.clone());
+        let contribution = capability.create(&services).expect("activation succeeds");
+        let tool = contribution.tools.first().expect("one contributed tool");
+
+        // Activation bound the run's handle, so cancelling the run after
+        // activation still reaches the turn.
+        cancel.cancel();
+        let error = tool
+            .call(serde_json::json!({"prompt": "do the thing"}))
+            .await
+            .expect_err("a cancelled run must not run a nested turn");
+
+        assert_eq!(error.kind(), ToolErrorKind::Cancelled);
     }
 
     #[tokio::test]

@@ -59,11 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register(Arc::new(Web::new(&base_url, token.clone())?))?;
     // The Everruns-backed nested agent, reaching its model back through the
     // same gateway so the vendor credential never leaves it.
-    registry.register(Arc::new(promptforge_agent::Agents::with_model(
-        &base_url,
-        token,
-        &model_name,
-    )?))?;
+    // Lend the nested agent the same web search tool the calling prompt
+    // can declare, so its own loop can reach the web without the caller
+    // orchestrating the round trip.
+    registry.register(Arc::new(
+        promptforge_agent::Agents::with_model(&base_url, token.clone(), &model_name)?.with_tool(
+            Arc::new(promptforge_web_search::WebSearch::new(&base_url, token)?),
+        ),
+    ))?;
 
     let env = Environment::new()
         .client(GatewayClient::from_env()?)
