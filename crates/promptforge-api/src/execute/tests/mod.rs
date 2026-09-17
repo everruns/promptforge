@@ -1650,9 +1650,10 @@ async fn empty_stop_turn_without_tool_calls_fails() {
 }
 
 #[tokio::test]
-async fn empty_turn_without_finish_reason_after_tool_call_fails() {
-    // Fail closed: a missing finish reason is not "stop", so the empty turn
-    // is an error even after a successful dispatch.
+async fn empty_turn_without_finish_reason_after_tool_call_is_a_clean_exit() {
+    // The Everruns driver normalizes a missing finish reason to "stop" at
+    // the terminal event, so a quiet turn after dispatched work exits
+    // cleanly — the same as an explicit empty stop.
     let gateway = ScriptedGateway::start(vec![
         resp_tool_call("call_1", "echo", "{\"value\":\"hi\"}"),
         resp_text(""),
@@ -1661,8 +1662,12 @@ async fn empty_turn_without_finish_reason_after_tool_call_fails() {
     let addr = gateway.addr();
     let echo: Arc<dyn Tool> = Arc::new(EchoTool);
     let (out, events, turns) = run_tool_loop_recorded(addr, &[echo]).await;
-    assert!(matches!(out, Err(Error::EmptyModelReply { .. })));
-    assert_eq!(turns, 1, "only the tool-call turn completed");
+    assert_eq!(
+        out.as_deref()
+            .expect("a quiet turn after work must exit clean"),
+        ""
+    );
+    assert_eq!(turns, 2, "tool turn plus the accepted empty turn");
     assert_eq!(
         events,
         vec![
@@ -1674,7 +1679,10 @@ async fn empty_turn_without_finish_reason_after_tool_call_fails() {
                 "Gather".to_string(),
                 detail::TOOL_CALL_SUCCEEDED.to_string(),
             ),
-            ("Gather".to_string(), detail::MODEL_TURN_FAILED.to_string(),),
+            (
+                "Gather".to_string(),
+                detail::MODEL_TURN_COMPLETED.to_string(),
+            ),
         ]
     );
 }

@@ -136,8 +136,8 @@ impl CompletionError {
     pub fn is_timeout(&self) -> bool {
         match &self.inner {
             Error::Http(source) | Error::BackendBodyRead { source, .. } => source
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(reqwest::Error::is_timeout),
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some(),
             _ => false,
         }
     }

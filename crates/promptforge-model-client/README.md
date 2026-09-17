@@ -1,26 +1,41 @@
 # promptforge-model-client
 
-The PromptForge gateway's model client: an `OpenAI`-compatible chat
-completions transport (`GatewayClient`), the wire types it exchanges, the
-model catalog (`ModelCatalog`, `ModelDescriptor`, `ModelId`), and the
-prompt-local binding vocabulary (`ModelBinding`, `ModelSet`, `ModelView`,
-`ModelResolver`) the executor resolves `models.bind` declarations against.
+The PromptForge model client and model-catalog vocabulary: the
+Everruns-backed chat-completions transport plus the catalog and
+prompt-local binding vocabulary.
 
-The client holds only the gateway's URL and the shared key; the vendor
-credential lives in the gateway, so a caller never sees it. `complete` is
-the one completion method and always streams SSE internally: it requests
-`stream_options.include_usage`, accumulates the deltas into one
-`Completion`, and invokes the caller's callback with each live
-`StreamDelta` text or reasoning fragment (a caller with no use for deltas
-passes a no-op closure). A tool-call batch finished by `length` or
-`content_filter` fails whole, so partial arguments never execute.
+## Layout
 
-Each `Completion` carries the call's metadata parsed from the stream:
-the serving `model`, `usage` token accounting (with cached- and
-reasoning-token details), llama.cpp `timings`, vLLM `metrics`, and a
-`client_timing` (TTFT, mean inter-token latency, end-to-end) measured on
-the client's own clock. The metrics vocabulary (`Usage`, `LlamaTimings`,
-`VllmMetrics`, `ClientTiming`, `CallMetrics`) is canonical in
-`shared-promptforge-api` and re-exported at this crate's root. A
-malformed metadata section degrades to `None` with a `tracing` warning; it
-never fails the call.
+- `client::GatewayClient`: builds from a `GatewayEndpoint` plus a vendor
+  bearer key (or from the environment) and runs one chat completion to a
+  full `Completion`, streaming progress into the caller's delta callback.
+  The backend is Everruns — the OpenAI-compatible completions driver for
+  OpenAI endpoints (including OpenAI-compatible mocks) and the OpenRouter
+  driver for OpenRouter endpoints — so there is no gateway hop and the
+  vendor credential stays with the caller.
+- `client::{Message, ToolSchema, Completion, StreamDelta}`: the wire types
+  the client exchanges. Assistant tool calls arrive in either the flat
+  local shape or the OpenAI transcript shape the executor stores.
+- `client::{OPENAI_API_KEY, OPENROUTER_API_KEY, ...}`: environment
+  selection. `OPENAI_API_KEY` selects OpenAI (overridable via
+  `OPENAI_BASE_URL`); otherwise `OPENROUTER_API_KEY` selects OpenRouter
+  (overridable via `OPENROUTER_BASE_URL`). A loopback base URL may omit
+  the key for mock vendors.
+- `model::fetch_model_catalog`: lists the vendor's models (driver listing
+  first, direct `GET {base}/models` for hosts the driver cannot list) and
+  shapes them into a `ModelCatalog`. Entries without a context window are
+  skipped.
+- `model::{ModelId, ModelBinding, ModelSet, ModelView}`: the validated
+  model identity plus the prompt-local types a host resolves and freezes
+  model selections through.
+
+## Errors
+
+Vendor failures keep their HTTP status with the bounded, escaped vendor
+message (`Backend`); anything else becomes `Transport`. The taxonomy —
+`Disabled`, `Transport`, `Backend`, `MalformedResponse`, `EmptyReply`,
+`MissingConfiguration`, `InvalidConfiguration` — is unchanged from the
+gateway era, so downstream matches keep working.
+
+The crate contains no prompt parser, no Lua runtime, and no executor; it is
+the Everruns-backed model client only, never a universal client.

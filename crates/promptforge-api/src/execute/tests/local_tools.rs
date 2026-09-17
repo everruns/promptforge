@@ -101,7 +101,9 @@ async fn local_tool_handler_result_returns_to_the_model() {
         json!({
             "type": "object",
             "properties": { "value": { "type": "string" } },
-            "required": ["value"]
+            "required": ["value"],
+            // The Everruns driver strict-normalizes object schemas.
+            "additionalProperties": false
         })
     );
     // The handler's trusted return reaches the model verbatim (no guard wrap).

@@ -90,7 +90,9 @@ async fn always_advertises_concrete_schema_under_local_alias_and_dispatches_by_i
         json!({
             "type": "object",
             "properties": {"value": {"type": "string"}},
-            "required": ["value"]
+            "required": ["value"],
+            // The Everruns driver strict-normalizes object schemas.
+            "additionalProperties": false
         })
     );
     assert_ne!(function["name"], "canonical_wire");

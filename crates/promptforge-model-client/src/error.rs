@@ -121,7 +121,7 @@ pub enum Error {
     /// Reading a non-success backend response body failed at the transport
     /// layer.
     ///
-    /// Retains the [`reqwest::Error`] as the `#[source]` cause (MODEL-010)
+    /// Retains the underlying read failure as the `#[source]` cause (MODEL-010)
     /// rather than flattening the read failure into display text, so the error
     /// chain (timeout, connection reset) survives. The status the backend had
     /// already returned is preserved for classification.
@@ -205,9 +205,10 @@ pub enum Error {
     ModelSetLock(String),
 }
 
+/// Crate-internal constructors.
 impl Error {
     /// Wrap a transport-layer error, hiding its concrete type from the API.
-    pub(crate) fn http(source: reqwest::Error) -> Error {
+    pub(crate) fn http(source: impl std::error::Error + Send + Sync + 'static) -> Error {
         Error::Http(Box::new(source))
     }
 }

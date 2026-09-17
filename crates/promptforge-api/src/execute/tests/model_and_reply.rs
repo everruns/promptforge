@@ -38,7 +38,9 @@ Ask the model.\n\n\
         .last_request()
         .expect("complete must reach the gateway");
     assert_eq!(body["model"], "analyst");
-    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    // Thinking off sends no reasoning hint; the driver only sets
+    // reasoning_effort when thinking is explicitly enabled.
+    assert!(body.get("reasoning_effort").is_none());
 }
 
 #[tokio::test]
