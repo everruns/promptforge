@@ -95,6 +95,12 @@ pub(crate) fn install_shim_prelude(lua: &Lua) -> Result<()> {
     globals.raw_set("call", call).map_err(Error::lua)?;
     let fanout: Function = shims.raw_get("fanout").map_err(Error::lua)?;
     globals.raw_set("fanout", fanout).map_err(Error::lua)?;
+    // The `agent` namespace: one table with `run`, so the guest-facing
+    // spelling is `agent.run(prompt, opts)` beside `models.infer(prompt)`.
+    let agent_run: Function = shims.raw_get("agent_run").map_err(Error::lua)?;
+    let agent = lua.create_table().map_err(Error::lua)?;
+    agent.raw_set("run", agent_run).map_err(Error::lua)?;
+    globals.raw_set("agent", agent).map_err(Error::lua)?;
     let chat: Function = shims.raw_get("chat").map_err(Error::lua)?;
     lua.set_named_registry_value(CHAT_REGISTRY, chat)
         .map_err(Error::lua)?;

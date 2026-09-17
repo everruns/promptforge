@@ -208,6 +208,25 @@ fn the_shim_prelude_installs_tools_call_and_no_bare_global() {
 }
 
 #[test]
+fn the_shim_prelude_installs_the_agent_namespace() {
+    let nonce = GuardNonce::fresh();
+    let observer = NullObserver::default();
+    let mut vm = SectionVm::new(&nonce, "test-run", &observer, "Test")
+        .expect("section VM construction cannot fail");
+    vm.inject_host("", &json!({}), &fresh_access())
+        .expect("host injection cannot fail");
+    vm.install_coro_shims().expect("the shim prelude installs");
+    let (is_table, run_is_function): (bool, bool) = vm
+        .lua()
+        .load("return type(agent) == 'table', type(agent.run) == 'function'")
+        .eval()
+        .expect("the namespace probe evaluates");
+    assert!(is_table, "agent installs as a namespace table");
+    assert!(run_is_function, "agent.run installs as the delegation shim");
+    vm.teardown(&observer, "Test");
+}
+
+#[test]
 fn tool_call_counts_seed_read_and_reject_unknown_keys() {
     let lua = lua_with_tools();
     let bound = ToolSet::for_test(

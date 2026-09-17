@@ -26,7 +26,9 @@ impl Observer for Trace {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut command_line = std::env::args().skip(1);
-    let path = command_line.next().ok_or("usage: run-prompt <prompt.md> [args]")?;
+    let path = command_line
+        .next()
+        .ok_or("usage: run-prompt <prompt.md> [args]")?;
     let args: String = command_line.collect::<Vec<_>>().join(" ");
 
     let model_name = std::env::var("PROMPTFORGE_MODEL")?;
@@ -54,7 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = std::env::var("PROMPTFORGE_GATEWAY_URL")?;
     let token = std::env::var("PROMPTFORGE_GATEWAY_API_KEY").unwrap_or_else(|_| "local".to_owned());
     let mut registry = CapabilityRegistry::new();
-    registry.register(Arc::new(Web::new(&base_url, token)?))?;
+    registry.register(Arc::new(Web::new(&base_url, token.clone())?))?;
+    // The Everruns-backed nested agent, reaching its model back through the
+    // same gateway so the vendor credential never leaves it.
+    registry.register(Arc::new(promptforge_agent::Agents::with_model(
+        &base_url,
+        token,
+        &model_name,
+    )?))?;
 
     let env = Environment::new()
         .client(GatewayClient::from_env()?)

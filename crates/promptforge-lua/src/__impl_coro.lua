@@ -65,6 +65,28 @@ local function tools_call(alias_or_tool, args)
   return result
 end
 
+-- Delegate one task to a nested agent, the `promptforge/agent/run` tool
+-- under its conventional `agent` alias. This is the agent-shaped
+-- counterpart to `models.infer`: infer is one tool-free round against the
+-- section's bound model, while a nested agent carries its own
+-- instructions, its own tool loop, and its own iteration budget, and
+-- returns only the text it finished with. `opts.instructions` sets the
+-- nested agent's standing instructions.
+--
+-- The prompt must declare the slot as `tools: {agent_run:
+-- promptforge/agent/run}`, and the alias is `agent_run`, not `agent`,
+-- because a declared tool alias is installed as a Lua global: a slot named
+-- `agent` would shadow this namespace with the tool's own userdata and
+-- `agent.run` would fail on an unknown field. Without the slot the
+-- dispatch raises the usual unbound-alias error at this call site.
+local function agent_run(prompt, opts)
+  opts = opts or {}
+  return tools_call("agent_run", {
+    prompt = prompt,
+    instructions = opts.instructions,
+  })
+end
+
 -- One stateless tool-capable model round. The host installs this as
 -- models.chat in agent VMs only; a section VM never sees it. Both
 -- arguments pass through unvalidated: the protocol parse owns the whole
@@ -181,6 +203,7 @@ if tools then
 end
 
 return {
+  agent_run = agent_run,
   call = call_section,
   fanout = fanout_collection,
   chat = chat,

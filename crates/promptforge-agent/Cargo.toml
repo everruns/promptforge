@@ -1,0 +1,26 @@
+[package]
+name = "promptforge-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+description = "PromptForge promptforge/agent capability: a nested Everruns agent turn as a tool"
+keywords = ["promptforge", "llm", "agent", "everruns", "ai"]
+categories = ["api-bindings"]
+documentation = "https://cppalliance.github.io/promptforge/"
+
+[dependencies]
+async-trait.workspace = true
+shared-promptforge-api.workspace = true
+everruns = { version = "0.21.0", default-features = false, features = ["openai"] }
+everruns-openai = "0.18.7"
+serde_json.workspace = true
+
+[dev-dependencies]
+shared-vfs.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
