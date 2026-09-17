@@ -73,15 +73,15 @@ end
 -- returns only the text it finished with. `opts.instructions` sets the
 -- nested agent's standing instructions.
 --
--- The prompt must declare the slot as `tools: {agent_run:
--- promptforge/agent/run}`, and the alias is `agent_run`, not `agent`,
--- because a declared tool alias is installed as a Lua global: a slot named
--- `agent` would shadow this namespace with the tool's own userdata and
--- `agent.run` would fail on an unknown field. Without the slot the
--- dispatch raises the usual unbound-alias error at this call site.
+-- The namespace is `agent2` so it cannot collide with the slot alias: a
+-- declared tool alias installs as a Lua global, so naming both the
+-- namespace and the alias `agent` would leave the tool's own userdata
+-- shadowing the table. The prompt declares `tools: {agent:
+-- promptforge/agent/run}`; without the slot the dispatch raises the usual
+-- unbound-alias error at this call site.
 local function agent_run(prompt, opts)
   opts = opts or {}
-  return tools_call("agent_run", {
+  return tools_call("agent", {
     prompt = prompt,
     instructions = opts.instructions,
   })
