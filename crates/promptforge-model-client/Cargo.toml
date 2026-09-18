@@ -6,10 +6,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-description = "PromptForge gateway model client: OpenAI-shaped completions transport, wire types, and the model catalog/binding vocabulary"
+description = "PromptForge model client: Everruns-backed completions transport, wire types, and the model catalog/binding vocabulary"
 readme = "README.md"
-keywords = ["llm", "gateway", "openai", "http-client"]
-categories = ["web-programming::http-client"]
+keywords = ["llm", "openai", "openrouter"]
 documentation = "https://cppalliance.github.io/promptforge/"
 
 [dependencies]
@@ -18,10 +17,15 @@ documentation = "https://cppalliance.github.io/promptforge/"
 # re-exports.
 shared-promptforge-api.workspace = true
 promptforge-tool-picker.workspace = true
+everruns-openai = "0.18"
+everruns-openrouter = "0.18"
+everruns-provider = "0.25"
 reqwest.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 

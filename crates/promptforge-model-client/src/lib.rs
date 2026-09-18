@@ -1,13 +1,13 @@
-//! The PromptForge gateway's model client and model-catalog vocabulary.
+//! The PromptForge model client and model-catalog vocabulary.
 //!
-//! [`client`] holds the `OpenAI`-compatible chat-completions transport:
-//! [`client::GatewayClient`] speaks the always-streaming `/chat/completions`
-//! SSE shape to one gateway URL with a shared bearer key, and the wire types
-//! ([`client::Message`], [`client::ToolSchema`], [`client::Completion`],
-//! [`client::StreamDelta`]) are what it exchanges. [`model`] holds the
-//! catalog and prompt-local binding vocabulary: [`model::ModelCatalog`]
-//! built from the gateway's
-//! `GET /v1/models`, the validated [`model::ModelId`] identity, and the
+//! [`client`] holds the Everruns-backed chat-completions transport:
+//! [`client::GatewayClient`] drives the Everruns OpenAI-compatible
+//! completions driver against one vendor base URL with a bearer key, and the
+//! wire types ([`client::Message`], [`client::ToolSchema`],
+//! [`client::Completion`], [`client::StreamDelta`]) are what it exchanges.
+//! [`model`] holds the catalog and prompt-local binding vocabulary:
+//! [`model::ModelCatalog`] built from the vendor's model listing, the
+//! validated [`model::ModelId`] identity, and the
 //! [`model::ModelBinding`]/[`model::ModelSet`]/[`model::ModelView`] types a
 //! host resolves and freezes model selections through.
 //!
@@ -21,12 +21,11 @@
 //! canonical there too and re-exported through their historical paths.
 //!
 //! The crate contains no prompt parser, no Lua runtime, and no executor; it is
-//! the gateway's model client only, never a universal client.
+//! the Everruns-backed model client only, never a universal client.
 
 pub mod client;
 mod error;
 pub mod model;
-mod normalize;
 
 #[doc(hidden)]
 pub use crate::error::Error;

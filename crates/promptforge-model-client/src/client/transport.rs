@@ -1,135 +1,154 @@
-//! The HTTP transport: the gateway client, request construction, bounded
-//! SSE response reading, and environment loading.
+//! [`GatewayClient`]: the Everruns-backed chat transport.
+//!
+//! The client keeps its established shape: callers build it from a
+//! [`GatewayEndpoint`] plus a bearer key (or from the environment), then call
+//! [`GatewayClient::complete`] with the conversation, the tool schemas, and
+//! the invocation options. What changed is the backend: instead of POSTing an
+//! OpenAI-shaped request to a gateway over HTTP, the client drives the
+//! Everruns OpenAI-compatible completions driver
+//! ([`OpenAICompletionsChatDriver`]) directly. The driver speaks the same
+//! `/chat/completions` wire format (including server-sent-event streaming),
+//! so the observable contract - message roles, tool calls, usage reporting,
+//! and the whole [`CompletionError`] taxonomy - is unchanged.
+//!
+//! The endpoint selects the vendor driver. OpenAI endpoints (including
+//! OpenAI-compatible loopback mocks) use the Everruns OpenAI-compatible
+//! completions driver; OpenRouter endpoints use the Everruns OpenRouter
+//! driver, which carries OpenRouter's listing and headers. Both speak the
+//! same provider contract, so the mapping is identical. There is exactly one
+//! transport: no gateway-versus-Everruns switch, no provider enum in this
+//! crate's API.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use promptforge_model_client::client::{GatewayClient, GatewayEndpoint, Message, SecretString};
+//! use promptforge_model_client::model::CompletionOptions;
+//!
+//! # async fn run() -> Result<(), promptforge_model_client::model::CompletionError> {
+//! let endpoint = GatewayEndpoint::new("https://api.openai.com/v1")?;
+//! let client = GatewayClient::new(endpoint, SecretString::new("sk-test-key").expect("key"));
+//! let options = CompletionOptions::new("gpt-4o-mini");
+//! let completion = client
+//!     .complete(&[Message::user("hi")], None, &options, |_delta| {})
+//!     .await?;
+//! let _ = completion.result();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Reachable [`CompletionError`] kinds
+//!
+//! - F1 `Disabled`: the client was built by [`GatewayClient::disabled`].
+//! - F2 `Transport`: the vendor call timed out or its stream failed before a
+//!   complete turn arrived.
+//! - F3 `Backend`: the vendor rejected the call (authentication, unknown
+//!   model, rate limit, bad request, outage). The status and the bounded,
+//!   escaped vendor message travel in the error for the log tail.
+//! - F4 `MalformedResponse`: the accumulated turn overflowed the byte cap, a
+//!   tool-call batch was truncated by `length`/`content_filter` (partial
+//!   arguments must not execute), or the stream ended before its `[DONE]`
+//!   sentinel.
+//! - F5 `EmptyReply`: the turn carried neither text nor tool calls.
+//! - F6 `MissingConfiguration`: no vendor key was configured (see
+//!   [`GatewayClient::from_env`]).
+//! - F7 `InvalidConfiguration`: a caller-side value cannot be sent (unknown
+//!   message role, tool message without `tool_call_id`, unparseable
+//!   assistant tool call).
+//!
+//! [`CompletionError`]: crate::model::CompletionError
+//! [`OpenAICompletionsChatDriver`]: everruns_openai::OpenAICompletionsChatDriver
 
-use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
-use shared_promptforge_api::events::ClientTiming;
+use everruns_openai::OpenAICompletionsChatDriver;
+use everruns_openrouter::OpenRouterChatDriver;
+use everruns_provider::{BearerAuth, Provider};
+use serde_json::{Value, json};
+use tracing::debug;
 
-use super::stream::{Applied, SseScanner, StreamAccumulator};
-use super::{Completion, GatewayEndpoint, Message, SecretString, StreamDelta, ToolSchema};
-use crate::model::{CompletionError, CompletionOptions};
-use crate::{Error, Result};
+use super::{
+    Completion, CompletionResult, GatewayEndpoint, Message, SecretString, StreamDelta, ToolSchema,
+    mapping::{
+        EMPTY_REPLY, EMPTY_REPLY_REASONING_IGNORED, TimeoutElapsed, accumulate_turn,
+        build_call_config, map_messages, map_tools,
+    },
+};
+// Re-exported at its previous path for the test suite, which escapes diagnostics.
+#[cfg(test)]
+pub(crate) use super::mapping::escape_controls;
+use crate::{
+    Error, Result,
+    model::{CompletionError, CompletionOptions},
+};
 
-/// A chat completions client bound to one gateway URL and, usually, the
-/// gateway's shared bearer key.
+/// Default request timeout: the whole turn, including streaming, must finish
+/// within it.
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default response cap, in bytes of accumulated text.
+pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Builds the Everruns provider for a base URL: the OpenRouter driver for
+/// OpenRouter hosts, the OpenAI-compatible completions driver otherwise
+/// (OpenAI itself and OpenAI-compatible mocks share the wire shape).
+fn driver_for(base_url: &str) -> Provider {
+    if is_openrouter_url(base_url) {
+        Provider::new("promptforge", OpenRouterChatDriver::new())
+    } else {
+        Provider::new("promptforge", OpenAICompletionsChatDriver::new())
+    }
+}
+
+/// Whether a base URL points at OpenRouter.
+fn is_openrouter_url(base_url: &str) -> bool {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.contains("openrouter")))
+        .unwrap_or(false)
+}
+
+/// Run limits applied to one client.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLimits {
+    /// Whole-turn timeout, including streaming.
+    pub timeout: Duration,
+    /// Cap on accumulated response text, in bytes.
+    pub max_response_bytes: u64,
+}
+
+/// The single model transport: an Everruns chat driver bound to one vendor
+/// endpoint plus its bearer key.
 ///
-/// The key is optional: a gateway on the same machine admits keyless
-/// loopback callers by default, and a client built without a key
-/// ([`GatewayClient::keyless`]) sends no `Authorization` header at all.
+/// The `GatewayClient`/`GatewayEndpoint` names stay so every call site keeps
+/// working; only the backend changed (previously an HTTP gateway, now
+/// Everruns). `base_url`/`key` are kept for the [`GatewayClient::endpoint`]
+/// accessor and redacted debug output.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct GatewayClient {
-    transport: GatewayTransport,
+    provider: Option<Provider>,
     base_url: String,
-    /// The bearer presented on every request, or `None` to present nothing.
     key: Option<SecretString>,
-    /// Wall-clock cap applied to each completion request.
     request_timeout: Duration,
-    /// Byte ceiling enforced on a response body before it is decoded.
     max_response_bytes: u64,
 }
 
-/// Default per-request timeout, matching the executor's run limits.
-pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Default response-body ceiling, matching the executor's run limits.
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-
-#[derive(Clone)]
-enum GatewayTransport {
-    Http(reqwest::Client),
-    Disabled,
-}
-
-/// Builds the completion request body.
-///
-/// Every request streams: `stream` is always true and
-/// `stream_options.include_usage` asks the backend for the final
-/// empty-choices usage chunk, so token accounting survives the SSE path.
-fn build_request_body(
-    messages: &[Message],
-    tools: Option<&[ToolSchema]>,
-    options: &CompletionOptions,
-) -> Value {
-    let mut body = serde_json::json!({
-        "model": options.model,
-        "messages": messages,
-        "stream": true,
-        "stream_options": { "include_usage": true },
-    });
-    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
-        let wrapped: Vec<Value> = tools
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                })
-            })
-            .collect();
-        body["tools"] = Value::Array(wrapped);
-        body["tool_choice"] = Value::String("auto".into());
-    }
-    if let Some(temperature) = options.temperature {
-        body["temperature"] = serde_json::json!(temperature.get());
-    }
-    if let Some(max_tokens) = options.max_tokens {
-        body["max_tokens"] = serde_json::json!(max_tokens.get());
-    }
-    if let Some(thinking) = options.thinking {
-        body["chat_template_kwargs"] = serde_json::json!({
-            "enable_thinking": thinking,
-        });
-    }
-    body
-}
-
-impl fmt::Debug for GatewayClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The bearer key is a credential and must never appear in Debug output,
-        // logs, or panic messages. It is redacted to a fixed marker regardless of
-        // whether one is set, so no length or presence signal leaks either.
-        f.debug_struct("GatewayClient")
-            .field("base_url", &self.base_url)
-            .field("key", &"<redacted>")
-            .finish_non_exhaustive()
-    }
-}
-
 impl GatewayClient {
-    /// Build a client from a validated [`GatewayEndpoint`] and a redacted
-    /// [`SecretString`] bearer key (used by tests and by
-    /// [`GatewayClient::from_env`]).
+    /// Build a client that sends the endpoint's bearer key to the endpoint.
     ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn run() -> Result<(), promptforge_model_client::model::CompletionError> {
-    /// use promptforge_model_client::client::{GatewayClient, GatewayEndpoint, Message, SecretString};
-    /// use promptforge_model_client::model::CompletionOptions;
-    ///
-    /// let client = GatewayClient::new(
-    ///     GatewayEndpoint::new("http://127.0.0.1:8081/v1")?,
-    ///     SecretString::new("bearer-token")?,
-    /// );
-    /// let options = CompletionOptions::new("analyst");
-    /// let completion = client
-    ///     .complete(&[Message::user("hello")], None, &options, |_delta| {})
-    ///     .await?;
-    /// let _ = completion.result();
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// The driver is the Everruns OpenAI-compatible completions driver; an
+    /// endpoint whose URL is an OpenAI-compatible base (OpenAI itself, or
+    /// OpenRouter's `https://openrouter.ai/api/v1`) selects the vendor. The
+    /// key travels as a bearer credential and is never logged.
     #[must_use]
     pub fn new(endpoint: GatewayEndpoint, key: SecretString) -> GatewayClient {
+        let base_url = endpoint.url.clone();
+        let provider = driver_for(&base_url)
+            .base_url(base_url.clone())
+            .auth(BearerAuth::new(key.expose().to_owned()));
         GatewayClient {
-            transport: GatewayTransport::Http(reqwest::Client::new()),
+            provider: Some(provider),
             base_url: endpoint.url,
             key: Some(key),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -139,13 +158,11 @@ impl GatewayClient {
 
     /// Build a client that presents no bearer key.
     ///
-    /// Every request goes out without an `Authorization` header. This fits a
-    /// gateway on the same machine, which trusts keyless loopback callers by
-    /// default (and, on a shared machine, every other OS account there)
-    /// unless its operator set `trust_loopback = false`; against any other
-    /// gateway the requests fail with a `Backend` 401. Nothing here checks
-    /// the endpoint's host - the caller decides, and
-    /// [`GatewayClient::from_env`] decides by [`GatewayEndpoint::is_loopback`].
+    /// No `Authorization` header goes out. This fits a loopback mock vendor,
+    /// which trusts keyless callers; against any other vendor the calls fail
+    /// with a `Backend` authentication error. Nothing here checks the
+    /// endpoint's host - the caller decides, and [`GatewayClient::from_env`]
+    /// decides by [`GatewayEndpoint::is_loopback`].
     ///
     /// # Examples
     ///
@@ -159,8 +176,10 @@ impl GatewayClient {
     /// ```
     #[must_use]
     pub fn keyless(endpoint: GatewayEndpoint) -> GatewayClient {
+        let base_url = endpoint.url.clone();
+        let provider = driver_for(&base_url).base_url(base_url.clone());
         GatewayClient {
-            transport: GatewayTransport::Http(reqwest::Client::new()),
+            provider: Some(provider),
             base_url: endpoint.url,
             key: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -168,7 +187,7 @@ impl GatewayClient {
         }
     }
 
-    /// Build a client that cannot read gateway configuration or send HTTP.
+    /// Build a client that cannot read vendor configuration or send requests.
     ///
     /// Hosts use this explicit sentinel for hermetic execution paths. Any
     /// attempted model call fails with a `Disabled`-kind [`CompletionError`].
@@ -192,12 +211,23 @@ impl GatewayClient {
     #[must_use]
     pub fn disabled() -> GatewayClient {
         GatewayClient {
-            transport: GatewayTransport::Disabled,
+            provider: None,
             base_url: String::new(),
             key: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
+    }
+
+    /// The vendor base URL this client talks to (empty for [`GatewayClient::disabled`]).
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The bound Everruns provider, unless [`GatewayClient::disabled`].
+    pub(crate) fn provider(&self) -> Result<&Provider> {
+        self.provider.as_ref().ok_or(Error::GatewayDisabled)
     }
 
     /// Whether this client presents a bearer key; a test seam for the
@@ -207,11 +237,11 @@ impl GatewayClient {
         self.key.is_some()
     }
 
-    /// Applies the run's HTTP limits to this client.
+    /// Applies the run's request limits to this client.
     ///
-    /// Each completion request is bounded by `request_timeout`, and the response
-    /// body is refused once it would exceed `max_response_bytes` before any
-    /// UTF-8 or JSON decoding runs.
+    /// Each completion (including its stream) is bounded by
+    /// `request_timeout`, and accumulated response text is refused once it
+    /// would exceed `max_response_bytes`.
     ///
     /// # Examples
     ///
@@ -239,66 +269,42 @@ impl GatewayClient {
 
     /// Builds a client from the environment.
     ///
-    /// - URL: `PROMPTFORGE_GATEWAY_URL`. Required.
-    /// - Key: `PROMPTFORGE_GATEWAY_API_KEY`, the gateway's shared bearer.
-    ///   Required unless the URL's host is loopback (`127.0.0.1`, `::1`,
-    ///   `localhost`); a loopback gateway trusts keyless same-machine callers
-    ///   by default, so the client is then built keyless and sends no
-    ///   `Authorization` header. An empty value counts as unset. That trust
-    ///   also admits every other OS account on a shared machine, so an
-    ///   operator there sets `trust_loopback = false`; then set the key, or
-    ///   a keyless client's requests fail with a `Backend` 401.
+    /// [`OPENAI_API_KEY`] selects OpenAI ([`OPENAI_DEFAULT_BASE_URL`],
+    /// overridable via [`OPENAI_BASE_URL`]); otherwise
+    /// [`OPENROUTER_API_KEY`] selects OpenRouter
+    /// ([`OPENROUTER_DEFAULT_BASE_URL`], overridable via
+    /// [`OPENROUTER_BASE_URL`]). A loopback base URL may omit the key
+    /// (keyless mock vendors); anywhere else a missing key is a
+    /// `MissingConfiguration` error naming required versus actual.
     ///
-    /// # Errors
-    /// Returns a [`CompletionError`] with `Config` kind when
-    /// `PROMPTFORGE_GATEWAY_URL` is unset or invalid, when either variable is
-    /// set to a non-Unicode value, or when the URL's host is not loopback (a
-    /// LAN or remote gateway) and `PROMPTFORGE_GATEWAY_API_KEY` is unset or
-    /// empty.
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use promptforge_model_client::client::GatewayClient;
+    ///
+    /// # fn run() -> Result<(), promptforge_model_client::model::CompletionError> {
+    /// let client = GatewayClient::from_env()?;
+    /// let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn from_env() -> std::result::Result<GatewayClient, CompletionError> {
-        from_env_with(|name| match std::env::var(name) {
+        super::config::from_env_with(|name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
             Err(std::env::VarError::NotPresent) => Ok(None),
-            // A set-but-non-Unicode value is a real misconfiguration, surfaced
-            // explicitly instead of being silently treated as "not set".
-            Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidEnv(name.to_owned())),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(Error::InvalidEnv(format!("{name} is not valid unicode")))
+            }
         })
         .map_err(CompletionError::from)
     }
 
-    /// Send a list of messages and return the model's accumulated outcome.
+    /// Runs one chat completion to a full [`Completion`], streaming progress
+    /// into `on_delta`.
     ///
-    /// The one completion method, always streaming: the request asks for SSE
-    /// with `stream_options.include_usage`, deltas are accumulated into the
-    /// buffered body shape, and `on_delta` is invoked live with each
-    /// [`StreamDelta`] text or reasoning fragment (a caller with no use for
-    /// deltas passes a no-op closure). The returned [`Completion`] carries
-    /// the reassembled turn, the metadata parsed from the stream's summary
-    /// chunk, and a [`ClientTiming`](crate::ClientTiming) measured on this
-    /// client's own clock (TTFT, mean inter-token latency, end-to-end).
-    ///
-    /// When `tools` is `Some` and non-empty, each schema is wrapped into the
-    /// `OpenAI` function shape and sent as the request's `tools` array (with
-    /// `tool_choice` set to `auto`); passing `None` or an empty slice sends no
-    /// `tools` field, preserving the plain chat-completions behavior.
-    ///
-    /// `options.model` names the model on the wire. Optional `temperature`,
-    /// `max_tokens`, and `thinking` extend the request when present.
-    ///
-    /// # Errors
-    /// Returns a [`CompletionError`] whose [`kind`](CompletionError::kind) is
-    /// (F11 - the full reachable set):
-    /// - `Disabled` when this client was built with [`GatewayClient::disabled`];
-    /// - `Transport` on a transport-layer failure (connection, timeout) or
-    ///   when the stream carries a mid-flight error envelope;
-    /// - `Backend` when the gateway responds with a non-success status;
-    /// - `MalformedResponse` when the stream exceeds the size cap, a chunk's
-    ///   shape is unusable (the JSON decode failure is retained as a private
-    ///   `#[source]`), the stream ends without the `[DONE]` sentinel, or a
-    ///   tool-call batch is truncated by a `length`/`content_filter` finish
-    ///   reason (partial arguments must not execute);
-    /// - `EmptyReply` when the turn has neither non-empty tool calls nor
-    ///   non-empty text.
+    /// The driver always streams; text and reasoning deltas are reported as
+    /// they arrive and the returned completion carries the accumulated turn.
+    /// A caller with no use for deltas passes a no-op closure.
     pub async fn complete(
         &self,
         messages: &[Message],
@@ -306,197 +312,162 @@ impl GatewayClient {
         options: &CompletionOptions,
         on_delta: impl Fn(StreamDelta),
     ) -> std::result::Result<Completion, CompletionError> {
-        let GatewayTransport::Http(http) = &self.transport else {
-            return Err(CompletionError::from(Error::GatewayDisabled));
-        };
-        let request_body = build_request_body(messages, tools, options);
-
+        let provider = self.provider().map_err(CompletionError::from)?;
         let started = Instant::now();
-        let mut request = http
-            .post(format!("{}/chat/completions", self.base_url))
-            // reqwest's whole-request timeout covers the body read, so the
-            // run's wall-clock cap bounds the entire stream, not just the
-            // connection.
-            .timeout(self.request_timeout)
-            .json(&request_body);
-        if let Some(key) = &self.key {
-            request = request.bearer_auth(key.expose());
-        }
-        let mut response = request.send().await.map_err(Error::http)?;
+        let ever_messages = map_messages(messages)?;
+        let tools = tools.unwrap_or_default();
+        let config = build_call_config(options.model.as_str(), options, map_tools(tools)?);
+        let request_body = json!({
+            "vendor": "everruns",
+            "driver": "openai-completions",
+            "endpoint": self.base_url,
+            "model": options.model.as_str(),
+            "messages": messages
+                .iter()
+                .map(|message| json!({"role": message.role, "content": message.content}))
+                .collect::<Vec<_>>(),
+            "tools": tools.len(),
+            "stream": true,
+            "temperature": options.temperature.map(|temperature| temperature.get()),
+            "max_tokens": options.max_tokens.map(NonZeroU32::get),
+            "thinking": options.thinking,
+        });
+        debug!(
+            model = options.model.as_str(),
+            messages = ever_messages.len(),
+            tools = tools.len(),
+            "everruns completion started"
+        );
 
-        let status = response.status();
-        if !status.is_success() {
-            let raw_body = read_body_capped(response, self.max_response_bytes).await?;
-            // F5: bound the body, then escape control characters so a hostile
-            // payload cannot forge log lines. The escaped body is kept only for
-            // the opt-in `CompletionError::backend_body` accessor, never the
-            // public `Display`.
-            let body = String::from_utf8_lossy(&raw_body);
-            let body = escape_controls(&body, 2000);
-            return Err(CompletionError::from(Error::Backend {
-                status: status.as_u16(),
-                body,
-            }));
-        }
+        let turn = tokio::time::timeout(
+            self.request_timeout,
+            accumulate_turn(
+                provider,
+                ever_messages,
+                &config,
+                self.max_response_bytes,
+                started,
+                on_delta,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            CompletionError::from(Error::Http(Box::new(TimeoutElapsed {
+                after: self.request_timeout,
+            })))
+        })??;
 
-        let mut scanner = SseScanner::new();
-        let mut accumulator = StreamAccumulator::new();
-        let mut received: u64 = 0;
-        let mut first_delta: Option<Instant> = None;
-        let mut last_delta: Option<Instant> = None;
-        let mut delta_chunks: u32 = 0;
-        let mut done = false;
-        'read: while let Some(bytes) = response.chunk().await.map_err(Error::http)? {
-            received += bytes.len() as u64;
-            if received > self.max_response_bytes {
-                return Err(CompletionError::from(Error::MalformedResponse(format!(
-                    "response stream exceeds the {}-byte limit",
-                    self.max_response_bytes
-                ))));
-            }
-            scanner.extend(&bytes);
-            while let Some(data) = scanner.next_data() {
-                match accumulator.apply(&data, &on_delta)? {
-                    Applied::Done => {
-                        done = true;
-                        break 'read;
-                    }
-                    Applied::Chunk { delta: true } => {
-                        let now = Instant::now();
-                        first_delta.get_or_insert(now);
-                        last_delta = Some(now);
-                        delta_chunks += 1;
-                    }
-                    Applied::Chunk { delta: false } => {}
-                }
-            }
-        }
-        // A stream that ends without the sentinel was cut off; its
-        // accumulation may be missing the tail, so it must never pass for a
-        // complete turn.
-        if !done {
-            return Err(CompletionError::from(Error::MalformedResponse(
-                "completion stream ended without the [DONE] sentinel".into(),
-            )));
-        }
-
-        // The truncation rule runs before normalization: a tool-call batch
-        // cut short by `length` or `content_filter` may hold partial JSON
-        // arguments, and partial arguments must not execute.
-        if accumulator.has_tool_calls()
+        if !turn.tool_calls.is_empty()
             && matches!(
-                accumulator.finish_reason(),
+                turn.finish_reason.as_deref(),
                 Some("length" | "content_filter")
             )
         {
-            let reason = accumulator.finish_reason().unwrap_or_default().to_owned();
+            let reason = turn.finish_reason.clone().unwrap_or_default();
             return Err(CompletionError::from(Error::MalformedResponse(format!(
                 "tool-call batch truncated by finish_reason {reason:?}: \
                  partial arguments must not execute"
             ))));
         }
 
-        let client_timing = ClientTiming {
-            ttft_ms: first_delta.map(|at| duration_ms(at.duration_since(started))),
-            mean_itl_ms: match (first_delta, last_delta) {
-                (Some(first), Some(last)) if delta_chunks >= 2 => {
-                    Some(duration_ms(last.duration_since(first)) / f64::from(delta_chunks - 1))
-                }
-                _ => None,
-            },
-            e2e_ms: duration_ms(started.elapsed()),
+        let result = if turn.tool_calls.is_empty() {
+            if turn.text.trim().is_empty() {
+                let detail = if turn.reasoning.trim().is_empty() {
+                    EMPTY_REPLY
+                } else {
+                    EMPTY_REPLY_REASONING_IGNORED
+                };
+                return Err(CompletionError::from(Error::EmptyModelReply {
+                    detail,
+                    finish_reason: turn.finish_reason.clone(),
+                }));
+            }
+            CompletionResult::Text(turn.text)
+        } else {
+            CompletionResult::ToolCalls(turn.tool_calls)
         };
-
-        let response_body = accumulator.into_body();
-        let turn = crate::normalize::normalize(&response_body)?;
-        let metadata = crate::normalize::response_metadata(&response_body);
+        let reasoning_content = if turn.reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(turn.reasoning)
+        };
+        // A clean stop carries no finish reason downstream; anything else
+        // (length, content_filter, tool-calls finish) survives.
+        let finish_reason = turn
+            .finish_reason
+            .filter(|reason| reason.as_str() != "stop");
+        let response_body = json!({
+            "text": match &result {
+                CompletionResult::Text(text) => Value::String(text.clone()),
+                CompletionResult::ToolCalls(_) => Value::Null,
+            },
+            "tool_calls": match &result {
+                CompletionResult::ToolCalls(calls) => json!(calls
+                    .iter()
+                    .map(|call| json!({
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    }))
+                    .collect::<Vec<_>>()),
+                CompletionResult::Text(_) => Value::Null,
+            },
+            "finish_reason": finish_reason,
+            "model": turn.model.clone(),
+            "usage": {
+                "prompt_tokens": turn.usage.prompt_tokens,
+                "completion_tokens": turn.usage.completion_tokens,
+                "total_tokens": turn.usage.total_tokens,
+            },
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": match &result {
+                        CompletionResult::Text(text) => Value::String(text.clone()),
+                        CompletionResult::ToolCalls(_) => Value::Null,
+                    },
+                },
+                "finish_reason": finish_reason,
+            }],
+        });
         Ok(Completion {
-            result: turn.outcome,
-            finish_reason: turn.finish_reason,
-            reasoning_content: turn.reasoning_content,
-            model: metadata.model,
-            usage: metadata.usage,
-            llama_timings: metadata.llama_timings,
-            vllm_metrics: metadata.vllm_metrics,
-            client_timing: Some(client_timing),
+            result,
+            finish_reason,
+            reasoning_content,
+            model: turn
+                .model
+                .unwrap_or_else(|| options.model.as_str().to_owned()),
+            usage: Some(turn.usage),
+            llama_timings: None,
+            vllm_metrics: None,
+            client_timing: Some(turn.timing),
             request_body,
             response_body,
         })
     }
 }
 
-/// A duration as fractional milliseconds.
-fn duration_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
+impl std::fmt::Debug for GatewayClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayClient")
+            .field("base_url", &self.base_url)
+            .field(
+                "key",
+                &self
+                    .key
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<redacted>"),
+            )
+            .field("request_timeout", &self.request_timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
-/// Escapes control characters in a diagnostic body and bounds it to `max` chars.
+/// Builds a client from explicit environment values (a seam for tests).
 ///
-/// Control characters (including newlines and carriage returns) are rendered in
-/// their `\u{..}`/`\n` escaped form so a backend body cannot forge log lines or
-/// smuggle terminal control sequences into a diagnostic (F5). An empty body is
-/// reported as a fixed marker.
-pub(crate) fn escape_controls(body: &str, max: usize) -> String {
-    if body.is_empty() {
-        return "(empty body)".to_owned();
-    }
-    let mut escaped = String::with_capacity(body.len());
-    for ch in body.chars().take(max) {
-        if ch.is_control() {
-            for part in ch.escape_default() {
-                escaped.push(part);
-            }
-        } else {
-            escaped.push(ch);
-        }
-    }
-    escaped
-}
-
-/// Reads a response body, refusing it once it would exceed `cap` bytes.
-///
-/// The advertised `Content-Length` short-circuits an oversize body, and the
-/// streamed chunks are bounded so a gateway that omits or lies about the length
-/// still cannot force an unbounded allocation before decoding.
-async fn read_body_capped(mut response: reqwest::Response, cap: u64) -> Result<Vec<u8>> {
-    if let Some(len) = response.content_length()
-        && len > cap
-    {
-        return Err(Error::MalformedResponse(format!(
-            "response body of {len} bytes exceeds the {cap}-byte limit"
-        )));
-    }
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(Error::http)? {
-        if body.len() as u64 + chunk.len() as u64 > cap {
-            return Err(Error::MalformedResponse(format!(
-                "response body exceeds the {cap}-byte limit"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// The environment-driven constructor behind [`GatewayClient::from_env`],
-/// with the variable lookup injected so tests need not touch the process
-/// environment.
-///
-/// The key is optional exactly when the URL's host is loopback; an empty key
-/// counts as unset ([`SecretString::new`] refuses only an empty secret, and
-/// `Result::ok` folds that refusal into `None`).
-pub(crate) fn from_env_with(
-    lookup: impl Fn(&str) -> std::result::Result<Option<String>, Error>,
-) -> Result<GatewayClient> {
-    let base_url = lookup("PROMPTFORGE_GATEWAY_URL")?
-        .ok_or_else(|| Error::MissingEnv("PROMPTFORGE_GATEWAY_URL".into()))?;
-    let endpoint = GatewayEndpoint::new(&base_url).map_err(Error::from)?;
-    let key = lookup("PROMPTFORGE_GATEWAY_API_KEY")?
-        .map(SecretString::new)
-        .and_then(std::result::Result::ok);
-    match key {
-        Some(key) => Ok(GatewayClient::new(endpoint, key)),
-        None if endpoint.is_loopback() => Ok(GatewayClient::keyless(endpoint)),
-        None => Err(Error::MissingEnv("PROMPTFORGE_GATEWAY_API_KEY".into())),
-    }
-}
+/// Defined in [`config`](super::config) beside endpoint construction;
+/// re-exported here so existing import paths keep working.
+pub(crate) use super::config::from_env_with;

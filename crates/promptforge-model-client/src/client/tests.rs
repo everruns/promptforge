@@ -77,7 +77,7 @@ fn lookup_from<'a>(
 #[test]
 fn from_env_surfaces_non_unicode_value_instead_of_dropping_it() {
     let err = from_env_with(|name| {
-        if name == "PROMPTFORGE_GATEWAY_URL" {
+        if name == OPENAI_API_KEY {
             Err(Error::InvalidEnv(name.to_owned()))
         } else {
             Ok(Some("tok".to_owned()))
@@ -85,52 +85,83 @@ fn from_env_surfaces_non_unicode_value_instead_of_dropping_it() {
     })
     .expect_err("a non-Unicode variable must be surfaced, not treated as missing");
     assert!(
-        matches!(err, Error::InvalidEnv(ref name) if name == "PROMPTFORGE_GATEWAY_URL"),
+        matches!(err, Error::InvalidEnv(ref name) if name == OPENAI_API_KEY),
         "expected an explicit InvalidEnv error, got {err:?}"
     );
 }
 
 #[test]
-fn from_env_missing_gateway_url() {
-    let err = from_env_with(lookup_from(&[("PROMPTFORGE_GATEWAY_API_KEY", "tok")]))
-        .expect_err("missing URL must fail");
+fn from_env_missing_vendor_key() {
+    let err = from_env_with(lookup_from(&[])).expect_err("missing keys must fail");
     assert!(matches!(
         err,
-        Error::MissingEnv(name) if name == "PROMPTFORGE_GATEWAY_URL"
+        Error::MissingEnv(name) if name == "OPENAI_API_KEY or OPENROUTER_API_KEY"
     ));
 }
 
 #[test]
-fn from_env_missing_gateway_key() {
-    // A LAN gateway never trusts a keyless caller, so the key stays required
+fn from_env_prefers_openai_over_openrouter() {
+    let client = from_env_with(lookup_from(&[
+        (OPENAI_API_KEY, "sk-openai"),
+        (OPENROUTER_API_KEY, "sk-or"),
+    ]))
+    .expect("an OpenAI key must win");
+    assert!(client.has_key());
+    assert_eq!(client.endpoint(), OPENAI_DEFAULT_BASE_URL);
+}
+
+#[test]
+fn from_env_selects_openrouter_without_an_openai_key() {
+    let client = from_env_with(lookup_from(&[(OPENROUTER_API_KEY, "sk-or")]))
+        .expect("an OpenRouter key must work alone");
+    assert!(client.has_key());
+    assert_eq!(client.endpoint(), OPENROUTER_DEFAULT_BASE_URL);
+}
+
+#[test]
+fn from_env_honours_base_url_overrides() {
+    let client = from_env_with(lookup_from(&[
+        (OPENAI_API_KEY, "sk-openai"),
+        (OPENAI_BASE_URL, "https://proxy.example/v1"),
+    ]))
+    .expect("an OpenAI base override must win");
+    assert_eq!(client.endpoint(), "https://proxy.example/v1");
+    let client = from_env_with(lookup_from(&[
+        (OPENROUTER_API_KEY, "sk-or"),
+        (OPENROUTER_BASE_URL, "https://or-proxy.example/api/v1"),
+    ]))
+    .expect("an OpenRouter base override must win");
+    assert_eq!(client.endpoint(), "https://or-proxy.example/api/v1");
+}
+
+#[test]
+fn from_env_missing_vendor_key_outside_loopback() {
+    // A LAN vendor never trusts a keyless caller, so the key stays required
     // there; an empty value is the same as no value. Only the exact name
     // `localhost` is loopback: a name that merely contains it is not.
     for key_pairs in [
-        vec![("PROMPTFORGE_GATEWAY_URL", "http://192.168.1.20:8081/v1")],
+        vec![("OPENAI_BASE_URL", "http://192.168.1.20:8081/v1")],
         vec![
-            ("PROMPTFORGE_GATEWAY_URL", "http://192.168.1.20:8081/v1"),
-            ("PROMPTFORGE_GATEWAY_API_KEY", ""),
+            ("OPENAI_BASE_URL", "http://192.168.1.20:8081/v1"),
+            (OPENAI_API_KEY, ""),
         ],
-        vec![("PROMPTFORGE_GATEWAY_URL", "https://gateway.example.com/v1")],
-        vec![(
-            "PROMPTFORGE_GATEWAY_URL",
-            "http://localhost.evil.com:8081/v1",
-        )],
-        vec![("PROMPTFORGE_GATEWAY_URL", "http://notlocalhost:8081/v1")],
+        vec![("OPENAI_BASE_URL", "https://models.example.com/v1")],
+        vec![("OPENAI_BASE_URL", "http://localhost.evil.com:8081/v1")],
+        vec![("OPENAI_BASE_URL", "http://notlocalhost:8081/v1")],
     ] {
         let err = from_env_with(lookup_from(&key_pairs))
-            .expect_err("missing key against a non-loopback gateway must fail");
+            .expect_err("missing key against a non-loopback vendor must fail");
         assert!(
-            matches!(err, Error::MissingEnv(ref name) if name == "PROMPTFORGE_GATEWAY_API_KEY"),
+            matches!(err, Error::MissingEnv(_)),
             "expected MissingEnv for {key_pairs:?}, got {err:?}"
         );
     }
 }
 
 #[test]
-fn from_env_missing_gateway_key_is_fine_for_a_loopback_gateway() {
-    // A loopback gateway trusts keyless same-machine callers by default, so
-    // the key is optional for every loopback spelling; the built client is
+fn from_env_missing_vendor_key_is_fine_for_a_loopback_vendor() {
+    // A loopback vendor mock trusts keyless same-machine callers by default,
+    // so the key is optional for every loopback spelling; the built client is
     // the keyless one, which the Debug form cannot distinguish (no presence
     // signal leaks), so the header test below pins what it sends.
     for url in [
@@ -140,22 +171,21 @@ fn from_env_missing_gateway_key_is_fine_for_a_loopback_gateway() {
         "http://localhost:8081/v1",
         "http://LOCALHOST:8081/v1",
     ] {
-        let client = from_env_with(lookup_from(&[("PROMPTFORGE_GATEWAY_URL", url)]))
+        let client = from_env_with(lookup_from(&[(OPENAI_BASE_URL, url)]))
             .unwrap_or_else(|err| panic!("a loopback URL needs no key, got {err:?} for {url}"));
         assert!(
             !client.has_key(),
             "the client built for {url} must carry no key"
         );
-        let empty_key = from_env_with(lookup_from(&[
-            ("PROMPTFORGE_GATEWAY_URL", url),
-            ("PROMPTFORGE_GATEWAY_API_KEY", ""),
-        ]))
-        .unwrap_or_else(|err| panic!("an empty key on loopback is unset, got {err:?} for {url}"));
+        let empty_key = from_env_with(lookup_from(&[(OPENAI_BASE_URL, url), (OPENAI_API_KEY, "")]))
+            .unwrap_or_else(|err| {
+                panic!("an empty key on loopback is unset, got {err:?} for {url}")
+            });
         assert!(!empty_key.has_key());
     }
     let keyed = from_env_with(lookup_from(&[
-        ("PROMPTFORGE_GATEWAY_URL", "http://127.0.0.1:8081/v1"),
-        ("PROMPTFORGE_GATEWAY_API_KEY", "tok"),
+        (OPENAI_BASE_URL, "http://127.0.0.1:8081/v1"),
+        (OPENAI_API_KEY, "tok"),
     ]))
     .expect("a loopback URL with a key builds");
     assert!(
@@ -530,11 +560,8 @@ async fn complete_sends_completion_options_and_stream_flags_on_the_wire() {
     assert_eq!(body["model"], "analyst");
     assert_eq!(body["temperature"], 0.0);
     assert_eq!(body["max_tokens"], 128);
-    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-    // The one completion method always streams and always asks for the
-    // final usage chunk.
+    // The one completion method always streams.
     assert_eq!(body["stream"], true);
-    assert_eq!(body["stream_options"]["include_usage"], true);
 }
 
 #[tokio::test]
@@ -630,8 +657,9 @@ async fn complete_refuses_a_success_stream_over_the_size_cap() {
 
 #[tokio::test]
 async fn complete_refuses_a_backend_error_body_over_the_size_cap() {
-    // F14 (body-size, error path): a non-success body larger than the cap is
-    // also refused before it is buffered.
+    // The vendor driver reads the error body itself, so an oversized error
+    // body surfaces as a backend failure with the bounded vendor message
+    // rather than a transport cap refusal.
     let base = spawn_raw_gateway(
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         "this backend error body is definitely longer than eight bytes",
@@ -648,18 +676,15 @@ async fn complete_refuses_a_backend_error_body_over_the_size_cap() {
     let err = client
         .complete(&[Message::user("hi")], None, &openai_options(), |_| {})
         .await
-        .expect_err("an oversize error body must be refused");
-    assert_eq!(
-        err.kind(),
-        crate::model::CompletionErrorKind::MalformedResponse
-    );
+        .expect_err("an error body must fail the completion");
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
 }
 
 #[tokio::test]
 async fn complete_refuses_a_malformed_stream_chunk() {
-    // F14: a 200 whose stream carries an undecodable chunk is
-    // MalformedResponse, and the decode failure is preserved as the
-    // error-chain source.
+    // F14: a 200 whose stream carries an undecodable chunk fails the vendor
+    // stream, which surfaces as a backend failure; the turn never completes
+    // on partial bytes.
     let base = spawn_raw_gateway(axum::http::StatusCode::OK, "data: { not json\n\n").await;
     let client = GatewayClient::new(
         GatewayEndpoint::new(&base).expect("valid endpoint"),
@@ -669,22 +694,14 @@ async fn complete_refuses_a_malformed_stream_chunk() {
         .complete(&[Message::user("hi")], None, &openai_options(), |_| {})
         .await
         .expect_err("undecodable chunk must fail");
-    assert_eq!(
-        err.kind(),
-        crate::model::CompletionErrorKind::MalformedResponse
-    );
-    let source =
-        std::error::Error::source(&err).expect("the decode error must be a preserved source");
-    assert!(
-        source.downcast_ref::<serde_json::Error>().is_some(),
-        "the preserved source must be the JSON decode error, got {source}"
-    );
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
 }
 
 #[tokio::test]
 async fn complete_refuses_malformed_tool_call_fragments_at_the_boundary() {
     // F14: a well-formed HTTP 200 whose streamed tool-call fragment carries
-    // non-string arguments is rejected at the client boundary, not passed on.
+    // non-string arguments is rejected by the vendor driver's strict flush,
+    // which surfaces as a backend failure; the malformed call never executes.
     let client = sse_client(sse_body(&[serde_json::json!({
         "choices": [{ "index": 0, "delta": { "tool_calls": [{
             "index": 0, "id": "c1", "type": "function",
@@ -696,10 +713,7 @@ async fn complete_refuses_malformed_tool_call_fragments_at_the_boundary() {
         .complete(&[Message::user("hi")], None, &openai_options(), |_| {})
         .await
         .expect_err("malformed tool arguments must be rejected");
-    assert_eq!(
-        err.kind(),
-        crate::model::CompletionErrorKind::MalformedResponse
-    );
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
 }
 
 #[tokio::test]
@@ -746,14 +760,12 @@ async fn streamed_text_usage_timings_and_client_timing_accumulate() {
         ],
         "each content fragment reaches the callback live, in order"
     );
-    assert_eq!(completion.finish_reason(), Some("stop"));
-    assert_eq!(completion.model(), "qwen3-30b");
+    assert_eq!(completion.finish_reason(), None);
+    // The driver reports the requested model id, not a serving alias: with
+    // no gateway in the path the requested id is the vendor id.
+    assert_eq!(completion.model(), "m");
     let usage = completion.usage().expect("usage from the final chunk");
     assert_eq!(usage.total_tokens, 10);
-    let timings = completion
-        .llama_timings()
-        .expect("timings from the final chunk");
-    assert_eq!(timings.predicted_n, 3);
     let timing = completion
         .client_timing()
         .expect("the streaming transport measures its own clock");
@@ -842,9 +854,9 @@ async fn streamed_tool_call_fragments_reassemble_into_the_batch() {
 
 #[tokio::test]
 async fn truncated_tool_call_batch_fails_the_completion() {
-    // A length or content_filter finish with tool calls means the batch may
-    // hold partial JSON arguments; the whole batch fails rather than
-    // executing a fragment.
+    // The vendor driver drops a tool batch capped by length or
+    // content_filter instead of emitting it, so the turn surfaces empty
+    // (and fails) rather than executing partial arguments.
     for reason in ["length", "content_filter"] {
         let client = sse_client(sse_body(&[
             serde_json::json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
@@ -862,12 +874,8 @@ async fn truncated_tool_call_batch_fails_the_completion() {
             .expect_err("a truncated tool-call batch must fail");
         assert_eq!(
             err.kind(),
-            crate::model::CompletionErrorKind::MalformedResponse,
+            crate::model::CompletionErrorKind::EmptyReply,
             "finish_reason {reason:?}"
-        );
-        assert!(
-            err.to_string().contains("truncated"),
-            "the error names the truncation: {err}"
         );
     }
 }
@@ -922,10 +930,11 @@ async fn stream_without_done_sentinel_is_malformed() {
 }
 
 #[tokio::test]
-async fn mid_stream_error_envelope_is_a_transport_failure() {
-    // The gateway relays a mid-flight failure as a data: error envelope on
-    // an already-open 200 stream; the completion classifies it as a
-    // transport failure, never as model output.
+async fn mid_stream_error_envelope_is_a_backend_failure() {
+    // The vendor relays a mid-flight failure as a data: error envelope on
+    // an already-open 200 stream. The driver cannot parse it as a chunk,
+    // so the completion fails as a backend failure; the envelope is never
+    // model output.
     let client = sse_client(sse_body(&[
         content_chunk("par"),
         serde_json::json!({ "error": {
@@ -937,9 +946,265 @@ async fn mid_stream_error_envelope_is_a_transport_failure() {
         .complete(&[Message::user("hi")], None, &openai_options(), |_| {})
         .await
         .expect_err("an error envelope must fail the completion");
-    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Transport);
-    let source = std::error::Error::source(&err)
-        .expect("the envelope message must ride as the cause")
-        .to_string();
-    assert!(source.contains("upstream died"), "cause: {source}");
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
+}
+
+#[tokio::test]
+async fn unauthorized_vendor_key_is_a_backend_error_with_status() {
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+
+    async fn handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"message": "Incorrect API key", "code": 401}})),
+        )
+    }
+    let app = Router::new().route("/v1/chat/completions", post(handler));
+    let client = client_for(app).await;
+    let err = client
+        .complete(&[Message::user("hi")], None, &openai_options(), |_| {})
+        .await
+        .expect_err("a 401 must fail the completion");
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
+    assert_eq!(err.status(), Some(401));
+}
+
+#[tokio::test]
+async fn unknown_vendor_model_is_a_backend_error_with_status() {
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+
+    async fn handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {"message": "The model `nope` does not exist", "code": 404}})),
+        )
+    }
+    let app = Router::new().route("/v1/chat/completions", post(handler));
+    let client = client_for(app).await;
+    let err = client
+        .complete(&[Message::user("hi")], None, &openai_options(), |_| {})
+        .await
+        .expect_err("a 404 must fail the completion");
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
+    assert_eq!(err.status(), Some(404));
+}
+
+#[tokio::test]
+async fn catalog_fetch_against_an_unlistable_vendor_is_a_backend_error() {
+    // The mock base URL is a custom host, which the driver cannot list, so
+    // the fetch falls back to GET {base}/models; the mock answers that
+    // with a bare 404, which surfaces as a backend failure.
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+
+    async fn handler() -> (StatusCode, Json<Value>) {
+        (StatusCode::NOT_FOUND, Json(json!({"error": "nope"})))
+    }
+    let app = Router::new().route("/v1/chat/completions", post(handler));
+    let client = client_for(app).await;
+    let err = crate::model::fetch_model_catalog(client.endpoint(), "tok")
+        .await
+        .expect_err("an unlistable vendor must fail the catalog fetch");
+    assert_eq!(err.kind(), crate::model::CompletionErrorKind::Backend);
+    assert_eq!(err.status(), Some(404));
+}
+
+mod mapping_tests {
+    use std::num::NonZeroU32;
+
+    use everruns_provider::AgentLoopError;
+    use serde_json::json;
+
+    use super::mapping::{
+        build_call_config, map_llm_error, map_messages, map_tools, sniff_vendor_status,
+    };
+    use crate::client::{Message, ToolSchema};
+    use crate::model::{CompletionErrorKind, CompletionOptions, Temperature};
+
+    #[test]
+    fn roles_and_tool_wiring_map() {
+        let messages = vec![
+            Message::user("hi"),
+            Message::assistant("working"),
+            Message::tool("call-1", "result"),
+        ];
+        let mapped = map_messages(&messages).expect("roles must map");
+        assert_eq!(mapped.len(), 3);
+        assert_eq!(
+            mapped[2].tool_call_id.as_deref(),
+            Some("call-1"),
+            "tool id must survive"
+        );
+    }
+
+    #[test]
+    fn unknown_role_is_invalid_configuration() {
+        let mut message = Message::user("hi");
+        message.role = "oracle".to_owned();
+        let err = map_messages(&[message]).expect_err("unknown role must fail");
+        assert_eq!(err.kind(), CompletionErrorKind::Config);
+    }
+
+    #[test]
+    fn tool_message_without_id_is_invalid_configuration() {
+        let mut message = Message::tool("call-1", "result");
+        message.tool_call_id = None;
+        let err = map_messages(&[message]).expect_err("missing id must fail");
+        assert_eq!(err.kind(), CompletionErrorKind::Config);
+    }
+
+    #[test]
+    fn assistant_tool_calls_map() {
+        let message = Message::assistant_tool_calls(vec![json!({
+            "id": "call-9",
+            "name": "lookup",
+            "arguments": {"q": "x"},
+        })]);
+        let mapped = map_messages(std::slice::from_ref(&message)).expect("must map");
+        let calls = mapped[0].tool_calls.as_ref().expect("calls must survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].id, "call-9");
+    }
+
+    #[test]
+    fn nested_transcript_tool_calls_map() {
+        // The executor stores assistant calls in the OpenAI transcript shape.
+        let message = Message::assistant_tool_calls(vec![json!({
+            "id": "call-9",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"},
+        })]);
+        let mapped = map_messages(std::slice::from_ref(&message)).expect("must map");
+        let calls = mapped[0].tool_calls.as_ref().expect("calls must survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].id, "call-9");
+    }
+
+    #[test]
+    fn schemas_become_client_side_tools() {
+        let schema = ToolSchema::new(
+            "lookup",
+            "look things up",
+            json!({"type": "object", "properties": {}}),
+        )
+        .expect("schema must build");
+        let tools = map_tools(std::slice::from_ref(&schema)).expect("must map");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "lookup");
+    }
+
+    #[test]
+    fn call_config_carries_options() {
+        let options = CompletionOptions {
+            model: "m".into(),
+            temperature: Some(Temperature::new(0.5).expect("valid temperature")),
+            max_tokens: NonZeroU32::new(64),
+            thinking: Some(true),
+        };
+        let config = build_call_config("m", &options, Vec::new());
+        assert_eq!(config.model, "m");
+        assert_eq!(config.temperature, Some(0.5));
+        assert_eq!(config.max_tokens, Some(64u32));
+        assert!(config.reasoning_effort.is_some(), "thinking must map");
+    }
+
+    #[test]
+    fn vendor_status_parses_from_driver_messages() {
+        assert_eq!(
+            sniff_vendor_status("OpenAI API error (429 Too Many Requests): slow"),
+            Some(429)
+        );
+        assert_eq!(sniff_vendor_status("boom"), None);
+        assert_eq!(sniff_vendor_status("OpenAI API error (99): x"), None);
+    }
+
+    #[test]
+    fn unknown_model_maps_to_404() {
+        let err = map_llm_error(AgentLoopError::model_not_available("nope"));
+        assert_eq!(err.kind(), CompletionErrorKind::Backend);
+        assert_eq!(err.status(), Some(404));
+    }
+}
+
+/// Live OpenAI check: needs `OPENAI_API_KEY` (and optionally
+/// `OPENAI_TEST_MODEL`, defaulting to `gpt-4o-mini`). Ignored by default;
+/// run explicitly to verify the vendor path.
+#[tokio::test]
+#[ignore = "needs OPENAI_API_KEY"]
+async fn live_openai_completion_round_trip() {
+    let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+    let model = std::env::var("OPENAI_TEST_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let endpoint = GatewayEndpoint::new(super::OPENAI_DEFAULT_BASE_URL).expect("default URL");
+    let client = GatewayClient::new(endpoint, SecretString::new(&key).expect("key"));
+    let options = CompletionOptions::new(&model);
+    let completion = client
+        .complete(
+            &[Message::user("Reply with exactly: ok")],
+            None,
+            &options,
+            |_| {},
+        )
+        .await
+        .expect("live OpenAI completion must succeed");
+    match completion.result() {
+        super::CompletionResult::Text(text) => {
+            assert!(text.contains("ok"), "unexpected reply: {text}")
+        }
+        super::CompletionResult::ToolCalls(_) => panic!("expected a text reply"),
+    }
+}
+
+/// Live OpenRouter check: needs `OPENROUTER_API_KEY` (and optionally
+/// `OPENROUTER_TEST_MODEL`). Ignored by default; run explicitly to verify
+/// the OpenRouter vendor path.
+#[tokio::test]
+#[ignore = "needs OPENROUTER_API_KEY"]
+async fn live_openrouter_completion_round_trip() {
+    let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+    let model =
+        std::env::var("OPENROUTER_TEST_MODEL").unwrap_or_else(|_| "openai/gpt-4o-mini".into());
+    let endpoint = GatewayEndpoint::new(super::OPENROUTER_DEFAULT_BASE_URL).expect("default URL");
+    let client = GatewayClient::new(endpoint, SecretString::new(&key).expect("key"));
+    let options = CompletionOptions::new(&model);
+    let completion = client
+        .complete(
+            &[Message::user("Reply with exactly: ok")],
+            None,
+            &options,
+            |_| {},
+        )
+        .await
+        .expect("live OpenRouter completion must succeed");
+    match completion.result() {
+        super::CompletionResult::Text(text) => {
+            assert!(text.contains("ok"), "unexpected reply: {text}")
+        }
+        super::CompletionResult::ToolCalls(_) => panic!("expected a text reply"),
+    }
+}
+
+/// Live OpenRouter catalog check: the default host lists models, and the
+/// catalog is non-empty. Ignored by default.
+#[tokio::test]
+#[ignore = "needs OPENROUTER_API_KEY"]
+async fn live_openrouter_catalog_lists_models() {
+    let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+    let base = super::OPENROUTER_DEFAULT_BASE_URL;
+    let catalog = crate::model::fetch_model_catalog(base, &key)
+        .await
+        .expect("live OpenRouter catalog must load");
+    assert!(
+        !catalog.models().is_empty(),
+        "the vendor catalog must not be empty"
+    );
 }

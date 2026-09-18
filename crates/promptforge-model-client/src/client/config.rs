@@ -201,3 +201,62 @@ impl TryFrom<&str> for GatewayEndpoint {
         GatewayEndpoint::new(url)
     }
 }
+
+/// Vendor key for OpenAI traffic.
+pub const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+/// Vendor key for OpenRouter traffic (OpenAI-compatible endpoint).
+pub const OPENROUTER_API_KEY: &str = "OPENROUTER_API_KEY";
+/// Optional base-URL override for OpenAI traffic.
+pub const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+/// Optional base-URL override for OpenRouter traffic.
+pub const OPENROUTER_BASE_URL: &str = "OPENROUTER_BASE_URL";
+/// Default OpenAI base URL, without the trailing `/chat/completions` path.
+pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+/// Default OpenRouter base URL, without the trailing `/chat/completions` path.
+pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Builds a client from explicit environment values (a seam for tests).
+pub(crate) fn from_env_with(
+    lookup: impl Fn(&str) -> crate::Result<Option<String>>,
+) -> crate::Result<super::transport::GatewayClient> {
+    let openai_key = lookup(OPENAI_API_KEY)?.filter(|key| !key.is_empty());
+    let openrouter_key = lookup(OPENROUTER_API_KEY)?.filter(|key| !key.is_empty());
+    if let Some(key) = openai_key {
+        let base = lookup(OPENAI_BASE_URL)?.unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.into());
+        let key = SecretString::new(key)
+            .map_err(|error| Error::InvalidConfig(format!("invalid {OPENAI_API_KEY}: {error}")))?;
+        return build_client(&base, Some(key));
+    }
+    if let Some(key) = openrouter_key {
+        let base =
+            lookup(OPENROUTER_BASE_URL)?.unwrap_or_else(|| OPENROUTER_DEFAULT_BASE_URL.into());
+        let key = SecretString::new(key).map_err(|error| {
+            Error::InvalidConfig(format!("invalid {OPENROUTER_API_KEY}: {error}"))
+        })?;
+        return build_client(&base, Some(key));
+    }
+    let base = lookup(OPENAI_BASE_URL)?.or(lookup(OPENROUTER_BASE_URL)?);
+    match base {
+        Some(url) => build_client(&url, None),
+        None => Err(Error::MissingEnv(format!(
+            "{OPENAI_API_KEY} or {OPENROUTER_API_KEY}"
+        ))),
+    }
+}
+
+/// Builds a client for an explicit base URL, allowing keyless loopback.
+fn build_client(
+    base_url: &str,
+    key: Option<SecretString>,
+) -> crate::Result<super::transport::GatewayClient> {
+    let endpoint =
+        GatewayEndpoint::new(base_url).map_err(|error| Error::InvalidConfig(error.to_string()))?;
+    match key {
+        Some(key) => Ok(super::transport::GatewayClient::new(endpoint, key)),
+        None if endpoint.is_loopback() => Ok(super::transport::GatewayClient::keyless(endpoint)),
+        None => Err(Error::MissingEnv(format!(
+            "{OPENAI_API_KEY} or {OPENROUTER_API_KEY} (keyless access is loopback-only; {})",
+            endpoint.url
+        ))),
+    }
+}

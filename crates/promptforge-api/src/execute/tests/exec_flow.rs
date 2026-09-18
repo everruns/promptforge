@@ -1540,7 +1540,7 @@ return models.infer(models.get('writer'), 'ping about ' .. item)\n\
         .expect_err("handle infer in an arm with no client must surface the lazy error");
     let rendered = error.to_string();
     assert!(
-        rendered.contains("missing environment variable: PROMPTFORGE_GATEWAY"),
+        rendered.contains("missing environment variable: OPENAI_API_KEY"),
         "the infer hook must surface the lazy client construction error: {rendered}"
     );
 }
